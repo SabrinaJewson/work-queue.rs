@@ -639,31 +639,28 @@ struct Rng {
 impl Rng {
     fn gen_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0xA0761D6478BD642F);
-        let t = u128::from(self.state).wrapping_mul(u128::from(self.state ^ 0xE7037ED1A0B428DB));
-        ((t >> 64) ^ t) as u64
+        let t = u128::from(self.state) * u128::from(self.state ^ 0xE7037ED1A0B428DB);
+        (t >> 64) as u64 ^ t as u64
     }
     fn gen_usize(&mut self) -> usize {
         self.gen_u64() as usize
     }
     fn gen_usize_to(&mut self, to: usize) -> usize {
         // Adapted from https://www.pcg-random.org/posts/bounded-rands.html
-        let mut x = self.gen_usize();
-        let mut m = (x as DoubleUsize).wrapping_mul(to as DoubleUsize);
-        if (m as usize) < to {
-            let mut t = -(to as isize) as usize;
-            if t >= to {
-                t -= to;
-                if t >= to {
-                    t %= to;
-                }
-            }
+        const USIZE_BITS: usize = mem::size_of::<usize>() * 8;
 
-            while (m as usize) < t {
+        let mut x = self.gen_usize();
+        let mut m = ((x as DoubleUsize * to as DoubleUsize) >> USIZE_BITS) as usize;
+        let mut l = x.wrapping_mul(to);
+        if l < to {
+            let t = to.wrapping_neg() % to;
+            while l < t {
                 x = self.gen_usize();
-                m = (x as DoubleUsize).wrapping_mul(to as DoubleUsize);
+                m = ((x as DoubleUsize * to as DoubleUsize) >> USIZE_BITS) as usize;
+                l = x.wrapping_mul(to);
             }
         }
-        (m >> (mem::size_of::<usize>() * 8)) as usize
+        m
     }
 }
 
