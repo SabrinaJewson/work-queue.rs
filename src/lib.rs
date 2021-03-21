@@ -53,6 +53,21 @@
 //! - Queues have a fixed number of local queues that they support, and this number cannot grow.
 //! - Each local queue has a fixed capacity, unlike `crossbeam-deque` which supports local queue
 //! growth. This makes our local queues faster.
+//!
+//! # Implementation
+//!
+//! This crate's queue implementation is based off [Tokio's current scheduler]. The idea is that
+//! each thread holds a fixed-capacity local queue, and there is also an unbounded global queue
+//! accessible by all threads. In the general case each worker thread will only interact with its
+//! local queue, avoiding lots of synchronization - but if one worker thread happens to have a
+//! lot less work than another, it will be spread out evenly due to work stealing.
+//!
+//! Additionally, each local queue stores a [non-stealable LIFO slot] to optimize for message
+//! passing patterns, so that if one task creates another, that created task will be polled
+//! immediately, instead of only much later when it reaches the front of the local queue.
+//!
+//! [Tokio's current scheduler]: https://tokio.rs/blog/2019-10-scheduler
+//! [non-stealable LIFO slot]: https://tokio.rs/blog/2019-10-scheduler#optimizing-for-message-passing-patterns
 #![warn(missing_debug_implementations, rust_2018_idioms, missing_docs)]
 
 use std::cell::UnsafeCell;
@@ -72,9 +87,6 @@ use concurrent_queue::ConcurrentQueue;
 ///
 /// This implements [`Clone`] and so multiple handles to the queue can be easily created and
 /// shared.
-///
-/// The order of the items in the queue is not guaranteed. All that is guaranteed is that every
-/// item passed in one end will eventually come out the other on an arbitrary local queue.
 #[derive(Debug)]
 pub struct Queue<T>(Arc<Shared<T>>);
 
@@ -241,12 +253,15 @@ impl<T> LocalQueue<T> {
     /// Push an item to the local queue. If the local queue is full, it will move half of its items
     /// to the global queue.
     pub fn push(&mut self, item: T) {
-        // First try to fill the LIFO slot.
-        let item = match self.lifo_slot.replace(item) {
-            Some(item) => item,
-            None => return,
-        };
+        if let Some(previous) = self.lifo_slot.replace(item) {
+            self.push_yield(previous);
+        }
+    }
 
+    /// Push an item to the local queue, skipping the LIFO slot. This can be used to give other
+    /// tasks a chance to run. Otherwise, there's a risk that one task will completely take over a
+    /// thread in a push-pop cycle due to the LIFO slot.
+    pub fn push_yield(&mut self, item: T) {
         let tail = self.local_tail();
 
         // We have to use Acquire to make sure that we don't write into memory that is
