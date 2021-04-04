@@ -207,7 +207,7 @@ unsafe impl<T: Send> Sync for LocalQueueInner<T> {}
 
 impl<T> Debug for LocalQueueInner<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let (protected_head, head) = unpack_heads(self.heads.load(atomic::Ordering::SeqCst));
+        let (protected_head, head) = unpack_heads(self.heads.load(atomic::Ordering::Acquire));
 
         f.debug_struct("LocalQueueInner")
             .field("protected_head", &protected_head)
@@ -383,30 +383,40 @@ impl<T> LocalQueue<T> {
         self.shared
             .0
             .searchers
-            .fetch_add(1, atomic::Ordering::AcqRel);
+            // No ordering is necessary because we use this as a hint, not for safety.
+            .fetch_add(1, atomic::Ordering::Relaxed);
 
         struct DecrementSearchers<'a>(&'a AtomicUsize);
         impl Drop for DecrementSearchers<'_> {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, atomic::Ordering::Release);
+                self.0.fetch_sub(1, atomic::Ordering::Relaxed);
             }
         }
         let _decrement_searchers = DecrementSearchers(&self.shared.0.searchers);
 
         // If there are no threads currently stealing from the global queue, we will steal from it.
-        //
-        // Acquire ordering is used to ensure that the following mutations of the local queue of
-        // items will not occur before the head has been loaded, preventing us from mutating entries
-        // being read by stealers.
-        if !self
+        if self
             .shared
             .0
             .stealing_global
-            .swap(true, atomic::Ordering::Acquire)
+            .compare_exchange(
+                false,
+                true,
+                // No ordering is necessary because we use this as a hint, not for safety.
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed,
+            )
+            .is_ok()
         {
-            if let Ok(popped_item) = self.shared.0.global_queue.pop() {
+            let popped_item = self.shared.0.global_queue.pop().ok();
+
+            if popped_item.is_some() {
                 // To avoid having to search for items again after we have completed this one, we
                 // fill half of our queue with items from the global queue.
+
+                // Ensure that the following mutations of the local queue of items will not occur
+                // before stealers have finished reading.
+                atomic::fence(atomic::Ordering::Acquire);
 
                 let mut tail = head;
                 let end_tail = head.wrapping_add(self.local.items.len() as u16 / 2);
@@ -424,12 +434,14 @@ impl<T> LocalQueue<T> {
                 // Release is necessary to make sure the above write is ordered before accesssing
                 // values.
                 self.local.tail.store(tail, atomic::Ordering::Release);
+            }
 
-                self.shared
-                    .0
-                    .stealing_global
-                    .store(false, atomic::Ordering::Relaxed);
+            self.shared
+                .0
+                .stealing_global
+                .store(false, atomic::Ordering::Relaxed);
 
+            if let Some(popped_item) = popped_item {
                 return Some(popped_item);
             }
         }
@@ -449,8 +461,8 @@ impl<T> LocalQueue<T> {
                 continue;
             }
 
-            // TODO: Explain why the orderings here are needed, if needed at all. I am just using
-            // them here because that is what Tokio does.
+            // Acquire is necessary to make sure that the below load of the tail does not occur
+            // before the load of the head.
             let mut queue_heads = queue.heads.load(atomic::Ordering::Acquire);
 
             let (old_queue_head, mut queue_head, steal) = loop {
@@ -485,9 +497,10 @@ impl<T> LocalQueue<T> {
                     // Only move the real head, as we still need to keep the steal head to read
                     // from the queue.
                     pack_heads(queue_head, new_queue_head),
-                    // TODO: Exaplin why the orderings here are needed, if at all. Again, I am just
-                    // using them here because that is what Tokio does.
-                    atomic::Ordering::AcqRel,
+                    // Release isn't necessary here since the above code doesn't access any memory.
+                    atomic::Ordering::Acquire,
+                    // Acquire is necessary when the compare_exchange fails because the result is
+                    // used to update the values in `queue_heads`; see the Acquire above.
                     atomic::Ordering::Acquire,
                 );
 
@@ -498,6 +511,10 @@ impl<T> LocalQueue<T> {
             };
 
             assert_ne!(steal, 0);
+
+            // Ensure that the following mutations of the local queue of items will not occur
+            // before stealers of our own queue have finished reading.
+            atomic::fence(atomic::Ordering::Acquire);
 
             // Read the first item separately, as we will be returning it.
             let first_item = unsafe {
@@ -521,10 +538,12 @@ impl<T> LocalQueue<T> {
                 let res = queue.heads.compare_exchange_weak(
                     pack_heads(old_queue_head, queue_head),
                     pack_heads(queue_head, queue_head),
-                    // TODO: Exaplin why the orderings here are needed, if at all. Again, I am just
-                    // using them here because that is what Tokio does.
-                    atomic::Ordering::AcqRel,
-                    atomic::Ordering::Acquire,
+                    // Release is necessary to make sure the above reads are ordered before any
+                    // other thread can write to the values.
+                    atomic::Ordering::Release,
+                    // No ordering is necessary because we're not accessing shared mutable state
+                    // after this point.
+                    atomic::Ordering::Relaxed,
                 );
 
                 match res {
@@ -560,7 +579,7 @@ impl<T> LocalQueue<T> {
     /// contention.
     #[must_use]
     pub fn searchers(&self) -> usize {
-        self.shared.0.searchers.load(atomic::Ordering::Acquire)
+        self.shared.0.searchers.load(atomic::Ordering::Relaxed)
     }
 
     /// Get the global queue that is associated with this local queue.
