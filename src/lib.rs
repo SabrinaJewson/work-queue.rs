@@ -70,18 +70,24 @@
 //! [non-stealable LIFO slot]: https://tokio.rs/blog/2019-10-scheduler#optimizing-for-message-passing-patterns
 #![warn(missing_debug_implementations, rust_2018_idioms, missing_docs)]
 
-use std::cell::UnsafeCell;
-use std::collections::hash_map::{DefaultHasher, RandomState};
+use std::cmp;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::{self, Debug, Formatter};
-use std::hash::{BuildHasher, Hasher};
+use std::hash::Hasher;
 use std::iter::FusedIterator;
 use std::mem::{self, MaybeUninit};
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{self, AtomicBool, AtomicU16, AtomicU32, AtomicUsize};
-use std::sync::Arc;
+#[cfg(not(loom))]
+use std::{collections::hash_map::RandomState, hash::BuildHasher};
 
-use concurrent_queue::ConcurrentQueue;
+#[cfg_attr(loom, path = "loom.rs")]
+#[cfg_attr(not(loom), path = "std.rs")]
+mod facade;
+use facade::atomic::{self, AtomicBool, AtomicU16, AtomicU32, AtomicUsize};
+use facade::Arc;
+use facade::GlobalQueue;
+use facade::UnsafeCell;
 
 /// A work queue.
 ///
@@ -130,7 +136,7 @@ impl<T> Queue<T> {
                         .collect(),
                 })
                 .collect(),
-            global_queue: ConcurrentQueue::unbounded(),
+            global_queue: GlobalQueue::new(),
             stealing_global: AtomicBool::new(false),
             taken_local_queues: AtomicBool::new(false),
             searchers: AtomicUsize::new(0),
@@ -157,7 +163,10 @@ impl<T> Queue<T> {
         LocalQueues {
             shared: self,
             index: 0,
+            #[cfg(not(loom))]
             hasher: RandomState::new().build_hasher(),
+            #[cfg(loom)]
+            hasher: DefaultHasher::new(),
         }
     }
 }
@@ -171,7 +180,7 @@ impl<T> Clone for Queue<T> {
 #[derive(Debug)]
 struct Shared<T> {
     local_queues: Box<[LocalQueueInner<T>]>,
-    global_queue: ConcurrentQueue<T>,
+    global_queue: GlobalQueue<T>,
     /// Whether a thread is currently stealing from the global queue. When `true`, threads
     /// should avoid trying to pop from it to reduce contention.
     stealing_global: AtomicBool,
@@ -247,7 +256,7 @@ impl<T> LocalQueue<T> {
     fn local_tail(&mut self) -> u16 {
         // SAFETY: The tail can be loaded without synchronization because only `self` can write to
         // it, and we have an `&mut self`.
-        unsafe { *(&self.local.tail as *const AtomicU16).cast() }
+        unsafe { facade::atomic_u16_unsync_load(&self.local.tail) }
     }
 
     /// Push an item to the local queue. If the local queue is full, it will move half of its items
@@ -274,7 +283,9 @@ impl<T> LocalQueue<T> {
             // If the local queue is not full, we can simply push to that.
             if tail.wrapping_sub(steal_head) < self.local.items.len() as u16 {
                 let i = tail & self.local.mask;
-                *unsafe { &mut *self.local.items[usize::from(i)].get() } = MaybeUninit::new(item);
+
+                self.local.items[usize::from(i)]
+                    .with_mut(|slot| unsafe { slot.write(MaybeUninit::new(item)) });
 
                 // Release is necessary to make sure the above write is ordered before accesssing
                 // values.
@@ -298,9 +309,14 @@ impl<T> LocalQueue<T> {
                 let res = self.local.heads.compare_exchange(
                     heads,
                     pack_heads(head.wrapping_add(half), head.wrapping_add(half)),
+                    // Release is necessary to ensure that any previous writes to `tail` become
+                    // visible after this point. If not made visible, we could get into a situation
+                    // where a thread reads an older value for `tail` than `heads`, and if `heads`
+                    // has advanced beyond the old `tail` by that point it causes all sorts of
+                    // issues.
+                    atomic::Ordering::AcqRel,
                     // Acquire is necessary because on failure we use the new value to update the
                     // head (see the Acquire ordering above).
-                    atomic::Ordering::Acquire,
                     atomic::Ordering::Acquire,
                 );
 
@@ -316,8 +332,7 @@ impl<T> LocalQueue<T> {
                     let index = head.wrapping_add(i) & self.local.mask;
                     let item = unsafe {
                         self.local.items[usize::from(index)]
-                            .get()
-                            .read()
+                            .with(|slot| slot.read())
                             .assume_init()
                     };
                     let _ = self.shared.0.global_queue.push(item);
@@ -341,7 +356,8 @@ impl<T> LocalQueue<T> {
         let tail = self.local_tail();
 
         // First try to pop from the local queue.
-        let res = self.local.heads.fetch_update(
+        let res = atomic_u32_fetch_update(
+            &self.local.heads,
             // No memory orderings are necessary here as this is the only thread that mutates
             // the data, and it's not currently mutating the data.
             atomic::Ordering::Relaxed,
@@ -367,17 +383,21 @@ impl<T> LocalQueue<T> {
                 let (_, head) = unpack_heads(heads);
                 let i = head & self.local.mask;
                 return Some(unsafe {
-                    self.local.items[usize::from(i)].get().read().assume_init()
+                    self.local.items[usize::from(i)]
+                        .with(|ptr| ptr.read())
+                        .assume_init()
                 });
             }
             // The local queue is empty.
             Err(heads) => heads,
         };
-        let (_, head) = unpack_heads(heads);
+        let (steal_head, head) = unpack_heads(heads);
+        assert_eq!(head, tail);
 
-        // Now we will try to steal into this queue from various places. Since we know the current
-        // queue is empty and stealers will only ever steal half the queue size, it is fine to fill
-        // half the queue without checking.
+        // The number of free slots in the queue we can steal into.
+        let space = self.local.items.len() as u16 - head.wrapping_sub(steal_head);
+
+        // Now we will try to steal into this queue from various places.
 
         // TODO: Potentially throttle stealing?
         self.shared
@@ -408,26 +428,28 @@ impl<T> LocalQueue<T> {
             )
             .is_ok()
         {
-            let popped_item = self.shared.0.global_queue.pop().ok();
+            let popped_item = self.shared.0.global_queue.pop();
 
             if popped_item.is_some() {
                 // To avoid having to search for items again after we have completed this one, we
                 // fill half of our queue with items from the global queue.
 
+                let steal = cmp::min(self.local.items.len() as u16 / 2, space);
+                let mut tail = head;
+                let end_tail = head.wrapping_add(steal);
+
                 // Ensure that the following mutations of the local queue of items will not occur
                 // before stealers have finished reading.
-                atomic::fence(atomic::Ordering::Acquire);
+                u32_acquire_fence(&self.local.heads);
 
-                let mut tail = head;
-                let end_tail = head.wrapping_add(self.local.items.len() as u16 / 2);
                 while tail != end_tail {
                     match self.shared.0.global_queue.pop() {
-                        Ok(item) => {
+                        Some(item) => {
                             let i = tail & self.local.mask;
-                            *unsafe { &mut *self.local.items[usize::from(i)].get() } =
-                                MaybeUninit::new(item);
+                            self.local.items[usize::from(i)]
+                                .with_mut(|slot| unsafe { slot.write(MaybeUninit::new(item)) });
                         }
-                        Err(_) => break,
+                        None => break,
                     }
                     tail = tail.wrapping_add(1);
                 }
@@ -480,13 +502,13 @@ impl<T> LocalQueue<T> {
                 // The number of items that can be stolen.
                 let stealable = queue_tail.wrapping_sub(queue_head);
 
-                if stealable == 0 {
-                    continue 'sibling_queues;
-                }
-
                 // The number of items we actually want to steal - this is half of their queue,
                 // rounded up.
-                let steal = stealable - stealable / 2;
+                let steal = cmp::min(stealable - stealable / 2, space);
+
+                if steal == 0 {
+                    continue 'sibling_queues;
+                }
 
                 let new_queue_head = queue_head.wrapping_add(steal);
 
@@ -514,23 +536,22 @@ impl<T> LocalQueue<T> {
 
             // Ensure that the following mutations of the local queue of items will not occur
             // before stealers of our own queue have finished reading.
-            atomic::fence(atomic::Ordering::Acquire);
+            u32_acquire_fence(&self.local.heads);
 
             // Read the first item separately, as we will be returning it.
             let first_item = unsafe {
                 queue.items[usize::from(old_queue_head & queue.mask)]
-                    .get()
-                    .read()
+                    .with(|slot| slot.read())
                     .assume_init()
             };
 
             // Copy over the stolen items to our queue.
             for i in 1..steal {
-                let src =
-                    queue.items[usize::from(old_queue_head.wrapping_add(i) & queue.mask)].get();
+                let src = &queue.items[usize::from(old_queue_head.wrapping_add(i) & queue.mask)];
                 let dst =
-                    self.local.items[usize::from(head.wrapping_add(i - 1) & self.local.mask)].get();
-                unsafe { src.copy_to_nonoverlapping(dst, 1) };
+                    &self.local.items[usize::from(head.wrapping_add(i - 1) & self.local.mask)];
+
+                src.with(|src| dst.with_mut(|dst| unsafe { src.copy_to_nonoverlapping(dst, 1) }))
             }
 
             // Update the steal head to match the real head.
@@ -570,7 +591,7 @@ impl<T> LocalQueue<T> {
 
         // Lastly, pop from the global queue without guarding against contention, since there is
         // nowhere else we can currently get items from.
-        self.shared.0.global_queue.pop().ok()
+        self.shared.0.global_queue.pop()
     }
 
     /// Get the number of threads that are currently searching for work inside [`pop`](Self::pop).
@@ -698,7 +719,35 @@ impl Rng {
     }
 }
 
-#[cfg(test)]
+fn atomic_u32_fetch_update<F>(
+    atomic: &AtomicU32,
+    set_order: atomic::Ordering,
+    fetch_order: atomic::Ordering,
+    mut f: F,
+) -> Result<u32, u32>
+where
+    F: FnMut(u32) -> Option<u32>,
+{
+    let mut prev = atomic.load(fetch_order);
+    while let Some(next) = f(prev) {
+        match atomic.compare_exchange_weak(prev, next, set_order, fetch_order) {
+            Ok(x) => return Ok(x),
+            Err(next_prev) => prev = next_prev,
+        }
+    }
+    Err(prev)
+}
+
+fn u32_acquire_fence(atomic: &AtomicU32) {
+    if cfg!(tsan) {
+        // ThreadSanitizer doesn't support fences.
+        atomic.load(atomic::Ordering::Acquire);
+    } else {
+        atomic::fence(atomic::Ordering::Acquire);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -750,18 +799,10 @@ mod tests {
         let queue = Queue::new(1, 2);
         let mut local = queue.local_queues().next().unwrap();
 
-        local.push(Box::new(0));
-
-        // Clear LIFO slot.
-        local.push(Box::new(12345));
-        assert_eq!(local.pop(), Some(Box::new(12345)));
+        local.push_yield(Box::new(0));
 
         for i in 0..10 {
-            local.push(Box::new(i + 1));
-
-            // Clear LIFO slot.
-            local.push(Box::new(12345));
-            assert_eq!(local.pop(), Some(Box::new(12345)));
+            local.push_yield(Box::new(i + 1));
 
             assert_eq!(local.pop(), Some(Box::new(i)));
         }
@@ -796,10 +837,8 @@ mod tests {
 
         let mut locals: Vec<_> = queue.local_queues().collect();
 
-        locals[0].push(Box::new(4));
-        locals[0].push(Box::new(5));
-        // LIFO slot
-        locals[0].push(Box::new(12345));
+        locals[0].push_yield(Box::new(4));
+        locals[0].push_yield(Box::new(5));
 
         locals[1].push(Box::new(1));
         locals[1].push(Box::new(0));
@@ -895,5 +934,134 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn cobb() {
+        use std::cell::UnsafeCell;
+
+        struct State(Box<[UnsafeCell<LocalQueue<Box<i32>>>]>);
+        unsafe impl Sync for State {}
+
+        cobb::run_test(cobb::TestCfg {
+            threads: 4,
+            iterations: if cfg!(miri) { 100 } else { 1000 },
+            sub_iterations: if cfg!(miri) { 1 } else { 10 },
+            setup: || {
+                let queue = Queue::new(4, 4);
+                State(
+                    queue
+                        .local_queues()
+                        .map(UnsafeCell::new)
+                        .collect::<Box<[_]>>(),
+                )
+            },
+            test: |State(local_queues), tctx| {
+                let queue = unsafe { &mut *local_queues[tctx.thread_index()].get() };
+                if tctx.thread_index() < 2 {
+                    queue.push(Box::new(5));
+                } else {
+                    queue.pop();
+                }
+            },
+            ..Default::default()
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+
+    fn locals<T, const N: usize>(queue: &Queue<T>) -> [LocalQueue<T>; N] {
+        array_init::from_iter(queue.local_queues()).expect("incorrect number of local queues")
+    }
+
+    #[test]
+    fn pop_none() {
+        loom::model(|| {
+            let queue: Queue<()> = Queue::new(2, 1);
+            let [mut local_1, mut local_2] = locals(&queue);
+            loom::thread::spawn(move || assert!(local_1.pop().is_none()));
+            assert!(local_2.pop().is_none());
+        });
+    }
+
+    #[test]
+    fn concurrent_steal_global() {
+        loom::model(|| {
+            let queue: Queue<Box<i32>> = Queue::new(2, 1);
+            let [mut local_1, mut local_2] = locals(&queue);
+            for i in 0..2 {
+                queue.push(Box::new(i));
+            }
+            loom::thread::spawn(move || {
+                local_1.pop();
+                local_1.pop();
+            });
+            local_2.pop();
+        });
+    }
+
+    #[test]
+    fn concurrent_steal_sibling() {
+        loom::model(|| {
+            let queue: Queue<Box<i32>> = Queue::new(3, 1);
+            let [mut local_1, mut local_2, mut local_3] = locals(&queue);
+            for i in 0..4 {
+                local_1.push(Box::new(i));
+            }
+            loom::thread::spawn(move || {
+                local_2.pop();
+                local_2.pop();
+            });
+            local_3.pop();
+        });
+    }
+
+    #[test]
+    fn global_spsc() {
+        loom::model(|| {
+            let queue: Queue<Box<i32>> = Queue::new(1, 4);
+            let [mut local] = locals(&queue);
+            loom::thread::spawn(move || {
+                for i in 0..6 {
+                    queue.push(Box::new(i));
+                }
+            });
+            for _ in 0..6 {
+                local.pop();
+            }
+        });
+    }
+
+    #[test]
+    fn sibling_spsc_few() {
+        loom::model(|| {
+            let queue: Queue<Box<i32>> = Queue::new(2, 4);
+            let [mut local_1, mut local_2] = locals(&queue);
+            loom::thread::spawn(move || {
+                for i in 0..4 {
+                    local_1.push(Box::new(i));
+                }
+            });
+            for _ in 0..4 {
+                local_2.pop();
+            }
+        });
+    }
+
+    #[test]
+    fn sibling_spsc_many() {
+        loom::model(|| {
+            let queue: Queue<Box<i32>> = Queue::new(2, 4);
+            let [mut local_1, mut local_2] = locals(&queue);
+            loom::thread::spawn(move || {
+                for i in 0..8 {
+                    local_1.push(Box::new(i));
+                }
+            });
+            local_2.pop();
+        });
     }
 }

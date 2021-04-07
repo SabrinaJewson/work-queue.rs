@@ -70,4 +70,13 @@ immediately, instead of only much later when it reaches the front of the local q
 [Tokio's current scheduler]: https://tokio.rs/blog/2019-10-scheduler
 [non-stealable LIFO slot]: https://tokio.rs/blog/2019-10-scheduler#optimizing-for-message-passing-patterns
 
-License: MIT OR Apache-2.0
+## Testing
+
+- Test it normally using `cargo test`
+- Test it with Miri using `cargo +nightly miri test`
+- Test it with ThreadSanitizer using `RUSTFLAGS="-Zsanitizer=thread --cfg tsan" cargo +nightly test --tests -Zbuild-std --target={your target triple}`
+- Test it with Loom using `RUSTFLAGS="--cfg loom" cargo test --tests --release`
+
+## License
+
+MIT OR Apache-2.0

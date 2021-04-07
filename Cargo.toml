@@ -10,4 +10,15 @@ keywords = ["scheduler", "lock-free"]
 categories = ["asynchronous", "algorithms", "concurrency", "data-structures"]
 
 [dependencies]
+
+[target.'cfg(not(loom))'.dependencies]
 concurrent-queue = "1.2.2"
+
+[target.'cfg(not(loom))'.dev-dependencies]
+cobb = "0.0.1"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.4.1"
+
+[target.'cfg(loom)'.dev-dependencies]
+array-init = "2.0.0"
