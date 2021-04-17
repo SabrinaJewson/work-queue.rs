@@ -169,6 +169,15 @@ impl<T> Queue<T> {
             hasher: DefaultHasher::new(),
         }
     }
+
+    /// Get the number of threads that are currently searching for work inside [`pop`](Self::pop).
+    ///
+    /// If this number is too high, you may wish to avoid calling [`pop`](Self::pop) to reduce
+    /// contention.
+    #[must_use]
+    pub fn searchers(&self) -> usize {
+        self.0.searchers.load(atomic::Ordering::Relaxed)
+    }
 }
 
 impl<T> Clone for Queue<T> {
@@ -600,7 +609,7 @@ impl<T> LocalQueue<T> {
     /// contention.
     #[must_use]
     pub fn searchers(&self) -> usize {
-        self.shared.0.searchers.load(atomic::Ordering::Relaxed)
+        self.shared.searchers()
     }
 
     /// Get the global queue that is associated with this local queue.
