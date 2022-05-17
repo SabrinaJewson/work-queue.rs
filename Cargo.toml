@@ -1,10 +1,9 @@
 [package]
 name = "work-queue"
 version = "0.1.3"
-authors = ["KaiJewson <kai.jewson@gmail.com>"]
 edition = "2018"
 description = "A concurrent work-stealing queue for building schedulers"
-repository = "https://github.com/KaiJewson/work-queue"
+repository = "https://github.com/SabrinaJewson/work-queue.rs"
 license = "MIT OR Apache-2.0"
 keywords = ["scheduler", "lock-free"]
 categories = ["asynchronous", "algorithms", "concurrency", "data-structures"]
