@@ -1,6 +1,6 @@
 [package]
 name = "work-queue"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2018"
 description = "A concurrent work-stealing queue for building schedulers"
 repository = "https://github.com/SabrinaJewson/work-queue.rs"
