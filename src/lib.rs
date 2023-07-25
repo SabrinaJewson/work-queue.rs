@@ -949,7 +949,7 @@ mod tests {
     fn cobb() {
         use std::cell::UnsafeCell;
 
-        struct State(Box<[UnsafeCell<LocalQueue<Box<i32>>>]>);
+        struct State(Option<Box<[UnsafeCell<LocalQueue<Box<i32>>>]>>);
         unsafe impl Sync for State {}
 
         cobb::run_test(cobb::TestCfg {
@@ -958,14 +958,15 @@ mod tests {
             sub_iterations: if cfg!(miri) { 1 } else { 10 },
             setup: || {
                 let queue = Queue::new(4, 4);
-                State(
+                State(Some(
                     queue
                         .local_queues()
                         .map(UnsafeCell::new)
                         .collect::<Box<[_]>>(),
-                )
+                ))
             },
-            test: |State(local_queues), tctx| {
+            test: |State(state), tctx| {
+                let local_queues = state.as_ref().unwrap();
                 let queue = unsafe { &mut *local_queues[tctx.thread_index()].get() };
                 if tctx.thread_index() < 2 {
                     queue.push(Box::new(5));
@@ -973,6 +974,7 @@ mod tests {
                     queue.pop();
                 }
             },
+            teardown: |state| *state = State(None),
             ..Default::default()
         });
     }
